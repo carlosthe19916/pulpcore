@@ -8,7 +8,6 @@ from pulpcore.app.models import Artifact
 
 
 def otel_metrics():
-
     # This configuration is needed since the worker thread is not using the opentelemetry
     # instrumentation agent to run the task code.
 

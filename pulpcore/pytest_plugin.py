@@ -846,7 +846,6 @@ def domain_factory(
         pytest.skip("Domains not enabled")
 
     def _domain_factory(**kwargs):
-
         storage_class, storage_settings = backend_settings_factory(
             storage_class=kwargs.pop("storage_class", None),
             storage_settings=kwargs.pop("storage_settings", None),

@@ -183,7 +183,6 @@ def test_fsexport_cross_domain(
     pulpcore_bindings,
     pub_and_repo,
 ):
-
     entities = [{}, {}]
     for e in entities:
         body = {

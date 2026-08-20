@@ -104,7 +104,6 @@ class DjangoMetricsMiddleware:
         self.get_response = get_response
 
     def _excluded_urls(self, url):
-
         excluded_urls = environ.get(
             "OTEL_PYTHON_EXCLUDED_URLS", environ.get("OTEL_PYTHON_DJANGO_EXCLUDED_URLS", "")
         )

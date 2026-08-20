@@ -1,12 +1,22 @@
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
+from datetime import timezone as dt_timezone
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 import pytest_asyncio
-from aiohttp.web_exceptions import HTTPMovedPermanently
+from aiohttp.web_exceptions import (
+    HTTPFound,
+    HTTPMovedPermanently,
+    HTTPNotModified,
+    HTTPRequestRangeNotSatisfiable,
+)
+from asgiref.sync import sync_to_async
 from django.db import IntegrityError
+from django.test import override_settings
+from django.utils.http import http_date
 from django_guid import clear_guid, set_guid
+from multidict import CIMultiDict
 
 from pulpcore.app.models import AppStatus
 from pulpcore.constants import TASK_STATES
@@ -584,6 +594,348 @@ def test_render_html_normal_name():
     """Normal directory names should also get the './' prefix."""
     html = Handler.render_html(["simple-dir/"])
     assert '<a href="./simple-dir/">simple-dir/</a>' in html
+
+
+async def _served_content_artifact(tmp_path):
+    """Create a ContentArtifact with a real (present) Artifact for serving tests."""
+    content = await create_content()
+    ca = await create_content_artifact(content)
+    ca.artifact = await create_artifact(tmp_path)
+    await ca.asave()
+    return ca
+
+
+_LAST_MODIFIED = datetime(2020, 1, 1, tzinfo=dt_timezone.utc)
+_IMS_AFTER = http_date(datetime(2021, 1, 1, tzinfo=dt_timezone.utc).timestamp())
+_CACHE_CONTROL = "public, max-age=0, must-revalidate"
+
+
+class _UnsatisfiableRange:
+    @property
+    def start(self):
+        raise ValueError()
+
+    stop = None
+
+
+def _request(*, ims=None, http_range=None, headers=None, range_header=None):
+    hdrs = dict(headers or {})
+    if ims is not None:
+        hdrs["If-Modified-Since"] = ims
+    if range_header is not None:
+        hdrs["Range"] = range_header
+    return Mock(
+        method="GET",
+        http_range=http_range if http_range is not None else Mock(start=None, stop=None),
+        headers=hdrs,
+    )
+
+
+async def _handler_with_built_response(tmp_path, monkeypatch, built=None):
+    handler = Handler()
+    ca = await _served_content_artifact(tmp_path)
+    if built is None:
+        built = Mock(headers={}, status=200)
+    monkeypatch.setattr(handler, "_build_response_from_content_artifact", Mock(return_value=built))
+    return handler, ca, built
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+async def test_serve_content_artifact_sets_last_modified(tmp_path, monkeypatch):
+    """A Last-Modified header is set on the served response when last_modified is provided."""
+    handler, ca, built = await _handler_with_built_response(tmp_path, monkeypatch)
+
+    with override_settings(CACHE_ENABLED=False):
+        response = await handler._serve_content_artifact(
+            ca, {}, _request(), last_modified=_LAST_MODIFIED
+        )
+
+    assert response is built
+    assert response.headers["Last-Modified"] == http_date(_LAST_MODIFIED.timestamp())
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+async def test_serve_content_artifact_returns_304_when_not_modified(tmp_path, monkeypatch):
+    """A matching If-Modified-Since yields a bodyless 304 on the non-cached path."""
+    handler, ca, _built = await _handler_with_built_response(tmp_path, monkeypatch)
+
+    with override_settings(CACHE_ENABLED=False):
+        with pytest.raises(HTTPNotModified) as exc:
+            await handler._serve_content_artifact(
+                ca, {}, _request(ims=_IMS_AFTER), last_modified=_LAST_MODIFIED
+            )
+
+    assert exc.value.headers["Last-Modified"] == http_date(_LAST_MODIFIED.timestamp())
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+async def test_serve_content_artifact_no_304_when_cache_enabled(tmp_path, monkeypatch):
+    """When caching is enabled the cache layer owns the 304 decision, so the full response
+    (with Last-Modified) is returned even for a matching If-Modified-Since."""
+    handler, ca, built = await _handler_with_built_response(tmp_path, monkeypatch)
+
+    with override_settings(CACHE_ENABLED=True):
+        response = await handler._serve_content_artifact(
+            ca, {}, _request(ims=_IMS_AFTER), last_modified=_LAST_MODIFIED
+        )
+
+    assert response is built
+    assert response.headers["Last-Modified"] == http_date(_LAST_MODIFIED.timestamp())
+
+
+def test_response_headers_sets_cache_control():
+    """All content responses instruct edge caches to revalidate on every use."""
+    headers = Handler.response_headers("path/to/file.iso")
+    assert headers["Cache-Control"] == _CACHE_CONTROL
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+async def test_serve_content_artifact_304_echoes_cache_control(tmp_path, monkeypatch):
+    """The bodyless 304 echoes Cache-Control (and Last-Modified) so caches keep revalidating."""
+    built = Mock(headers={"Cache-Control": _CACHE_CONTROL})
+    handler, ca, _built = await _handler_with_built_response(tmp_path, monkeypatch, built=built)
+
+    with override_settings(CACHE_ENABLED=False):
+        with pytest.raises(HTTPNotModified) as exc:
+            await handler._serve_content_artifact(
+                ca, {}, _request(ims=_IMS_AFTER), last_modified=_LAST_MODIFIED
+            )
+
+    assert exc.value.headers["Last-Modified"] == http_date(_LAST_MODIFIED.timestamp())
+    assert exc.value.headers["Cache-Control"] == _CACHE_CONTROL
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+async def test_serve_content_artifact_redirect_has_no_last_modified(tmp_path, monkeypatch):
+    """Redirect (object-storage) responses are left untouched: no Last-Modified, no 304."""
+    redirect = HTTPFound(
+        "http://example.test/redirect",
+        headers={"Cache-Control": _CACHE_CONTROL},
+    )
+    handler, ca, _built = await _handler_with_built_response(tmp_path, monkeypatch, built=redirect)
+
+    with override_settings(CACHE_ENABLED=False):
+        with pytest.raises(HTTPFound) as exc:
+            await handler._serve_content_artifact(ca, {}, _request(), last_modified=_LAST_MODIFIED)
+
+    assert "Last-Modified" not in exc.value.headers
+    assert "Cache-Control" not in exc.value.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+async def test_build_response_redirect_omits_cache_control(tmp_path, monkeypatch):
+    """Object-storage 302s are constructed without Cache-Control: public."""
+    handler = Handler()
+    ca = await _served_content_artifact(tmp_path)
+    domain = Mock(
+        storage_class="storages.backends.s3.S3Storage",
+        redirect_to_object_storage=True,
+        get_storage=Mock(return_value=Mock(url=Mock(return_value="https://s3.example/obj"))),
+    )
+    monkeypatch.setattr("pulpcore.content.handler.get_domain", lambda: domain)
+    headers = CIMultiDict({"Cache-Control": _CACHE_CONTROL})
+
+    response = handler._build_response_from_content_artifact(ca, headers, Mock(method="GET"))
+
+    assert isinstance(response, HTTPFound)
+    assert "Cache-Control" not in response.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "http_range,range_header",
+    [
+        (_UnsatisfiableRange(), "bytes=abc"),
+        (Mock(start=0, stop=1), "bytes=0-1"),
+    ],
+)
+async def test_serve_content_artifact_304_beats_range(
+    tmp_path, monkeypatch, http_range, range_header
+):
+    """A matching If-Modified-Since 304s; Range must not become 416 or 206."""
+    handler, ca, built = await _handler_with_built_response(tmp_path, monkeypatch)
+    request = _request(ims=_IMS_AFTER, http_range=http_range, range_header=range_header)
+
+    with override_settings(CACHE_ENABLED=False):
+        with pytest.raises(HTTPNotModified) as exc:
+            await handler._serve_content_artifact(ca, {}, request, last_modified=_LAST_MODIFIED)
+
+    assert exc.value.status == 304
+    assert exc.value.headers["Last-Modified"] == http_date(_LAST_MODIFIED.timestamp())
+    assert built.status == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+async def test_serve_content_artifact_invalid_range_is_416_when_modified(tmp_path, monkeypatch):
+    """Without a matching If-Modified-Since, an unsatisfiable Range is still 416."""
+    handler, ca, _built = await _handler_with_built_response(tmp_path, monkeypatch)
+
+    with override_settings(CACHE_ENABLED=False):
+        with pytest.raises(HTTPRequestRangeNotSatisfiable):
+            await handler._serve_content_artifact(
+                ca, {}, _request(http_range=_UnsatisfiableRange()), last_modified=_LAST_MODIFIED
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+async def test_serve_ca_streams_304_before_remote_fetch(monkeypatch):
+    """On-demand units 304 before streaming when If-Modified-Since covers Last-Modified."""
+    handler = Handler()
+    content = await create_content()
+    ca = await create_content_artifact(content)
+    last_modified = _LAST_MODIFIED
+    monkeypatch.setattr(handler, "_content_last_modified", AsyncMock(return_value=last_modified))
+    handler._stream_content_artifact = AsyncMock(return_value="streamed")
+    headers = {"Cache-Control": _CACHE_CONTROL}
+    request = Mock(headers={"If-Modified-Since": http_date(last_modified.timestamp())})
+
+    with pytest.raises(HTTPNotModified) as exc:
+        await handler._serve_ca(ca, headers, request, repository_version="rv")
+
+    handler._stream_content_artifact.assert_not_awaited()
+    assert exc.value.headers["Last-Modified"] == http_date(last_modified.timestamp())
+    assert exc.value.headers["Cache-Control"] == "public, max-age=0, must-revalidate"
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+async def test_serve_ca_looks_up_last_modified_and_serves(tmp_path, monkeypatch):
+    """_serve_ca looks up pulp_created and passes it to `_serve_content_artifact` (not headers)."""
+    handler = Handler()
+    ca = await _served_content_artifact(tmp_path)
+    last_modified = datetime(2020, 1, 1, tzinfo=dt_timezone.utc)
+    monkeypatch.setattr(handler, "_content_last_modified", AsyncMock(return_value=last_modified))
+    handler._serve_content_artifact = AsyncMock(return_value="served")
+    headers = {}
+    request = Mock()
+
+    result = await handler._serve_ca(ca, headers, request, publication="pub")
+
+    assert result == "served"
+    assert "Last-Modified" not in headers
+    handler._content_last_modified.assert_awaited_once_with(
+        ca, publication="pub", repository_version=None
+    )
+    handler._serve_content_artifact.assert_awaited_once_with(
+        ca, headers, request, last_modified=last_modified
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+async def test_serve_ca_streams_with_last_modified_when_artifact_missing(monkeypatch):
+    """On-demand units stamp Last-Modified on the stream headers, since there is no redirect."""
+    handler = Handler()
+    content = await create_content()
+    ca = await create_content_artifact(content)
+    last_modified = datetime(2020, 1, 1, tzinfo=dt_timezone.utc)
+    monkeypatch.setattr(handler, "_content_last_modified", AsyncMock(return_value=last_modified))
+    handler._stream_content_artifact = AsyncMock(return_value="streamed")
+    headers = {}
+    request = Mock(headers={})
+
+    result = await handler._serve_ca(ca, headers, request, repository_version="rv")
+
+    assert result == "streamed"
+    assert headers["Last-Modified"] == http_date(last_modified.timestamp())
+    handler._stream_content_artifact.assert_awaited_once()
+    stream_request, stream_response, stream_ca = handler._stream_content_artifact.call_args.args
+    assert stream_request is request
+    assert stream_ca is ca
+    assert stream_response.headers["Last-Modified"] == http_date(last_modified.timestamp())
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+async def test_match_and_stream_content_handler_ca_uses_serve_ca(tmp_path, monkeypatch):
+    """A ContentArtifact returned by content_handler is served with the distro's repo version."""
+    handler = Handler()
+    ca = await _served_content_artifact(tmp_path)
+    distro = Mock(
+        base_path="bp",
+        checkpoint=False,
+        content_handler=Mock(return_value=ca),
+        content_headers_for=Mock(return_value={}),
+        get_repository_publication_and_version=Mock(return_value=(None, "rv", "pub")),
+    )
+    monkeypatch.setattr(Handler, "_match_distribution", Mock(return_value=distro))
+    monkeypatch.setattr(Handler, "_permit", Mock(return_value=False))
+    handler._serve_ca = AsyncMock(return_value="ok")
+    request = Mock(path="/pulp/content/bp/c123")
+
+    result = await handler._match_and_stream("bp/c123", request)
+
+    assert result == "ok"
+    handler._serve_ca.assert_awaited_once()
+    assert handler._serve_ca.call_args.args[0] == ca
+    assert handler._serve_ca.call_args.kwargs["publication"] == "pub"
+    assert handler._serve_ca.call_args.kwargs["repository_version"] == "rv"
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+async def test_match_and_stream_fallback_uses_serve_ca(tmp_path, monkeypatch):
+    """Grace-period fallback serves the CA with the superseded publication for Last-Modified."""
+    handler = Handler()
+    ca = await _served_content_artifact(tmp_path)
+    distro = Mock(
+        base_path="bp",
+        checkpoint=False,
+        SERVE_FROM_PUBLICATION=True,
+        content_handler=Mock(return_value=None),
+        content_headers_for=Mock(return_value={}),
+        get_repository_publication_and_version=Mock(return_value=(None, None, None)),
+        get_fallback=Mock(return_value=(ca, "fallback_pub")),
+        remote=None,
+    )
+    monkeypatch.setattr(Handler, "_match_distribution", Mock(return_value=distro))
+    monkeypatch.setattr(Handler, "_permit", Mock(return_value=False))
+    handler._serve_ca = AsyncMock(return_value="ok")
+    request = Mock(path="/pulp/content/bp/c123")
+
+    result = await handler._match_and_stream("bp/c123", request)
+
+    assert result == "ok"
+    distro.get_fallback.assert_called_once_with("c123")
+    handler._serve_ca.assert_awaited_once()
+    assert handler._serve_ca.call_args.args[0] == ca
+    assert handler._serve_ca.call_args.kwargs["publication"] == "fallback_pub"
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+async def test_match_and_stream_pull_through_uses_serve_ca(request123, tmp_path):
+    """Pull-through with an existing ContentArtifact serves through ``_serve_ca``."""
+    handler = Handler()
+    content = await create_content()
+    ca = await create_content_artifact(content)
+    remote = await create_remote()
+    await create_remote_artifact(remote, ca)
+    repo = await create_repository()
+    distro = await create_distribution(remote, repository=repo)
+    handler._serve_ca = AsyncMock(return_value="ok")
+
+    try:
+        result = await handler._match_and_stream(f"{distro.base_path}/c123", request123)
+        assert result == "ok"
+        handler._serve_ca.assert_awaited_once()
+        assert handler._serve_ca.call_args.args[0] == ca
+        expected_rv = await sync_to_async(repo.latest_version)()
+        assert handler._serve_ca.call_args.kwargs["repository_version"] == expected_rv
+    finally:
+        await content.adelete()
+        await repo.adelete()
+        await remote.adelete()
+        await distro.adelete()
 
 
 @pytest.mark.asyncio
