@@ -243,6 +243,7 @@ def _load_function(task):
 
 
 def _add_timeout_to(coro_fn, task_name, task_pk):
+
     async def _wrapper():
         try:
             return await asyncio.wait_for(coro_fn(), timeout=IMMEDIATE_TIMEOUT)

@@ -327,6 +327,7 @@ class BaseURLField(serializers.CharField):
     """
 
     def to_representation(self, value):
+
         # When CONTENT_ORIGIN == None we need to set origin as "/" so that the base_url will
         # have the relative path like "/some/file/path", instead of "some/file/path"
         origin = "/"

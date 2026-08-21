@@ -725,7 +725,7 @@ class Handler:
         content_handler_result = await sync_to_async(distro.content_handler)(original_rel_path)
         if content_handler_result is not None:
             if isinstance(content_handler_result, ContentArtifact):
-                _, ch_repo_version, ch_publication = await sync_to_async(
+                ch_repository, ch_repo_version, ch_publication = await sync_to_async(
                     distro.get_repository_publication_and_version
                 )()
                 return await self._serve_ca(

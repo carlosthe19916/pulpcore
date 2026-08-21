@@ -1,83 +1,77 @@
 import os
 from datetime import datetime, timezone
 
+import pytest
 from aiohttp.test_utils import make_mocked_request
 from aiohttp.web import FileResponse
-from aiohttp.web_fileresponse import _FileResponseResult
 from django.utils.http import http_date
 
 from pulpcore.responses import PulpFileResponse
 
+# _make_response / _FileResponseResult exist only on aiohttp 3.11+. Lowerbounds installs 3.10.
+_SKIP_MAKE_RESPONSE = pytest.mark.skipif(
+    not hasattr(FileResponse, "_make_response"),
+    reason="aiohttp FileResponse._make_response requires aiohttp 3.11+",
+)
 
-def test_pulp_file_response_preserves_handler_last_modified(tmp_path):
-    """A handler-set Last-Modified is not overwritten by aiohttp's file-mtime assignment."""
-    path = tmp_path / "artifact"
-    path.write_text("data")
-    ours = http_date(1_000_000_000)  # a fixed, non-mtime value
-    response = PulpFileResponse(path, headers={"Last-Modified": ours})
-
-    # Simulate what aiohttp's FileResponse.prepare() does (self.last_modified = file mtime).
-    response.last_modified = 2_000_000_000
-
-    assert response.headers["Last-Modified"] == ours
+_PULP_LM = http_date(datetime(2024, 6, 1, tzinfo=timezone.utc).timestamp())
+_FILE_MTIME = 1_000_000_000  # 2001-09-09; IMS between this and _PULP_LM is the interesting case
+_IMS_AFTER_MTIME = http_date(datetime(2022, 1, 1, tzinfo=timezone.utc).timestamp())
 
 
-def test_pulp_file_response_never_emits_file_mtime(tmp_path):
-    """Without a handler Last-Modified, filesystem mtime is still not advertised."""
-    path = tmp_path / "artifact"
-    path.write_text("data")
-    response = PulpFileResponse(path)
-
-    response.last_modified = 1_000_000_000
-
-    assert "Last-Modified" not in response.headers
-
-
-def test_pulp_file_response_ignores_etag_when_owning_validator(tmp_path):
-    """mtime ETags are not advertised when Pulp owns Last-Modified."""
-    path = tmp_path / "artifact"
-    path.write_text("data")
-    response = PulpFileResponse(path, headers={"Last-Modified": http_date(1_000_000_000)})
-
-    response.etag = "abc123"
-
-    assert "ETag" not in response.headers
-
-
-def test_pulp_file_response_never_emits_mtime_etag(tmp_path):
-    """mtime ETags are not advertised even when the handler omitted Last-Modified."""
-    path = tmp_path / "artifact"
-    path.write_text("data")
-    response = PulpFileResponse(path)
-
-    response.etag = "abc123"
-
-    assert "ETag" not in response.headers
-
-
-def test_pulp_file_response_does_not_304_on_stale_file_mtime(tmp_path):
-    """IMS between file mtime and Pulp Last-Modified must not 304 on mtime."""
+def _artifact(tmp_path):
     path = tmp_path / "artifact"
     path.write_bytes(b"payload")
-    os.utime(path, (1_000_000_000, 1_000_000_000))  # 2001-09-09
+    os.utime(path, (_FILE_MTIME, _FILE_MTIME))
+    return path
 
-    pulp_lm = http_date(datetime(2024, 6, 1, tzinfo=timezone.utc).timestamp())
-    # After file mtime, before Pulp Last-Modified — stock FileResponse would 304.
-    ims = http_date(datetime(2022, 1, 1, tzinfo=timezone.utc).timestamp())
-    request = make_mocked_request("GET", "/", headers={"If-Modified-Since": ims})
 
-    pulp = PulpFileResponse(str(path), headers={"Last-Modified": pulp_lm})
+@pytest.mark.parametrize("with_handler_lm", [True, False], ids=["handler-lm", "no-lm"])
+def test_pulp_file_response_ignores_file_mtime(tmp_path, with_handler_lm):
+    """aiohttp's file-mtime assignment must not advertise a filesystem Last-Modified."""
+    headers = {"Last-Modified": _PULP_LM} if with_handler_lm else None
+    response = PulpFileResponse(_artifact(tmp_path), headers=headers)
+    response.last_modified = 2_000_000_000
+    if with_handler_lm:
+        assert response.headers["Last-Modified"] == _PULP_LM
+    else:
+        assert "Last-Modified" not in response.headers
+
+
+@pytest.mark.parametrize("with_handler_lm", [True, False], ids=["handler-lm", "no-lm"])
+def test_pulp_file_response_never_emits_mtime_etag(tmp_path, with_handler_lm):
+    """mtime ETags are not advertised, with or without a Pulp Last-Modified."""
+    headers = {"Last-Modified": _PULP_LM} if with_handler_lm else None
+    response = PulpFileResponse(_artifact(tmp_path), headers=headers)
+    response.etag = "abc123"
+    assert "ETag" not in response.headers
+
+
+@_SKIP_MAKE_RESPONSE
+@pytest.mark.parametrize("with_handler_lm", [True, False], ids=["handler-lm", "no-lm"])
+def test_pulp_file_response_does_not_304_on_file_mtime(tmp_path, with_handler_lm):
+    """IMS after file mtime must not 304; stock FileResponse would."""
+    from aiohttp.web_fileresponse import _FileResponseResult
+
+    path = _artifact(tmp_path)
+    headers = {"Last-Modified": _PULP_LM} if with_handler_lm else None
+    request = make_mocked_request("GET", "/", headers={"If-Modified-Since": _IMS_AFTER_MTIME})
+
+    pulp = PulpFileResponse(str(path), headers=headers)
     result, fobj, _st, _enc = pulp._make_response(request, "")
     try:
         assert result is _FileResponseResult.SEND_FILE
     finally:
         if fobj:
             fobj.close()
-    assert pulp.headers["Last-Modified"] == pulp_lm
+    if with_handler_lm:
+        assert pulp.headers["Last-Modified"] == _PULP_LM
+    else:
+        assert "Last-Modified" not in pulp.headers
 
     stock = FileResponse(str(path))
     result, fobj, _st, _enc = stock._make_response(
-        make_mocked_request("GET", "/", headers={"If-Modified-Since": ims}), ""
+        make_mocked_request("GET", "/", headers={"If-Modified-Since": _IMS_AFTER_MTIME}), ""
     )
     try:
         assert result is _FileResponseResult.NOT_MODIFIED
@@ -86,31 +80,12 @@ def test_pulp_file_response_does_not_304_on_stale_file_mtime(tmp_path):
             fobj.close()
 
 
-def test_pulp_file_response_without_validator_does_not_304_on_mtime(tmp_path):
-    """Publish-generated files with no Pulp Last-Modified must not 304 against mtime."""
-    path = tmp_path / "artifact"
-    path.write_bytes(b"payload")
-    os.utime(path, (1_000_000_000, 1_000_000_000))
-    ims = http_date(datetime(2022, 1, 1, tzinfo=timezone.utc).timestamp())
-    request = make_mocked_request("GET", "/", headers={"If-Modified-Since": ims})
-
-    response = PulpFileResponse(str(path))
-    result, fobj, _st, _enc = response._make_response(request, "")
-    try:
-        assert result is _FileResponseResult.SEND_FILE
-    finally:
-        if fobj:
-            fobj.close()
-    assert "Last-Modified" not in response.headers
-
-
+@_SKIP_MAKE_RESPONSE
 def test_pulp_file_response_does_not_blank_if_range(tmp_path):
     """If-Range stays available so aiohttp can refuse a stale Range instead of a corrupt 206."""
-    path = tmp_path / "artifact"
-    path.write_bytes(b"payload")
-    os.utime(path, (1_000_000_000, 1_000_000_000))
-    pulp_lm = http_date(1_700_000_000)
-    if_range = http_date(1_000_000_000)
+    from aiohttp.web_fileresponse import _FileResponseResult
+
+    if_range = http_date(_FILE_MTIME)
     request = make_mocked_request(
         "GET",
         "/",
@@ -120,11 +95,13 @@ def test_pulp_file_response_does_not_blank_if_range(tmp_path):
             "If-Modified-Since": if_range,
         },
     )
-    response = PulpFileResponse(str(path), headers={"Last-Modified": pulp_lm})
+    response = PulpFileResponse(str(_artifact(tmp_path)), headers={"Last-Modified": _PULP_LM})
     result, fobj, _st, _enc = response._make_response(request, "")
-    if fobj:
-        fobj.close()
+    try:
+        assert result is _FileResponseResult.SEND_FILE
+    finally:
+        if fobj:
+            fobj.close()
 
-    assert result is _FileResponseResult.SEND_FILE
     assert request.if_range is not None
     assert request.if_modified_since is None

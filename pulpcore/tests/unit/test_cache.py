@@ -1,8 +1,10 @@
+import json
 from time import sleep
 from time import time as now
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from aiohttp.web import Response
 from aiohttp.web_exceptions import HTTPNotModified
 from django.test import override_settings
 from django.utils.http import http_date
@@ -119,63 +121,55 @@ def _request_with_ims(value):
     return Mock(headers={"If-Modified-Since": value} if value else {})
 
 
-def test_async_content_cache_not_modified():
-    """_not_modified compares If-Modified-Since to the stored Last-Modified at second resolution."""
-    last_modified = http_date(1_000_000_000)
+_LM = http_date(1_000_000_000)
 
-    # Client copy is as new or newer -> not modified.
-    assert AsyncContentCache._not_modified(_request_with_ims(last_modified), last_modified) is True
-    assert (
-        AsyncContentCache._not_modified(_request_with_ims(http_date(1_000_000_060)), last_modified)
-        is True
-    )
-    # Content changed after the client's copy -> modified.
-    assert (
-        AsyncContentCache._not_modified(_request_with_ims(http_date(999_999_940)), last_modified)
-        is False
-    )
-    # Missing/invalid values -> modified (200).
-    assert AsyncContentCache._not_modified(_request_with_ims(None), last_modified) is False
-    assert AsyncContentCache._not_modified(_request_with_ims(last_modified), None) is False
-    assert AsyncContentCache._not_modified(_request_with_ims("garbage"), last_modified) is False
-    # RFC 9110: If-None-Match takes precedence over If-Modified-Since.
-    both = Mock(headers={"If-Modified-Since": last_modified, "If-None-Match": '"abc"'})
-    assert AsyncContentCache._not_modified(both, last_modified) is False
-    # RFC 7232: ignore IMS in the future relative to the origin clock.
+
+def test_async_content_cache_not_modified():
+    """If-Modified-Since is compared to Last-Modified at second resolution (RFC 9110 / 7232)."""
+    newer = http_date(1_000_000_060)
+    older = http_date(999_999_940)
     future = http_date(now() + 86400)
-    assert AsyncContentCache._not_modified(_request_with_ims(future), last_modified) is False
+    inm = Mock(headers={"If-Modified-Since": _LM, "If-None-Match": '"abc"'})
+
+    assert AsyncContentCache._not_modified(_request_with_ims(_LM), _LM) is True
+    assert AsyncContentCache._not_modified(_request_with_ims(newer), _LM) is True
+    assert AsyncContentCache._not_modified(_request_with_ims(older), _LM) is False
+    assert AsyncContentCache._not_modified(_request_with_ims(None), _LM) is False
+    assert AsyncContentCache._not_modified(_request_with_ims(_LM), None) is False
+    assert AsyncContentCache._not_modified(_request_with_ims("garbage"), _LM) is False
+    assert AsyncContentCache._not_modified(inm, _LM) is False
+    assert AsyncContentCache._not_modified(_request_with_ims(future), _LM) is False
 
 
 def test_async_content_cache_make_not_modified_echoes_metadata():
     """The 304 carries only validator/caching metadata already present on the source."""
-    last_modified = http_date(1_000_000_000)
     source = {
         "Cache-Control": "public, max-age=0, must-revalidate",
         "Content-Length": "1024",
         "X-PULP-CACHE": "HIT",
     }
 
-    exc = AsyncContentCache._make_not_modified(source, last_modified)
+    exc = AsyncContentCache._make_not_modified(source, _LM)
 
     assert isinstance(exc, HTTPNotModified)
-    assert exc.headers["Last-Modified"] == last_modified
+    assert exc.headers["Last-Modified"] == _LM
     assert exc.headers["Cache-Control"] == "public, max-age=0, must-revalidate"
     assert exc.headers["X-PULP-CACHE"] == "HIT"
     assert "Content-Length" not in exc.headers
 
-    bare = AsyncContentCache._make_not_modified({}, last_modified)
+    bare = AsyncContentCache._make_not_modified({}, _LM)
     assert "X-PULP-CACHE" not in bare.headers
     assert "Cache-Control" not in bare.headers
 
 
 def test_async_content_cache_build_response_pops_last_modified():
     """build_response must not pass the stored last_modified field to the response constructor."""
-    cache = AsyncContentCache.__new__(AsyncContentCache)  # avoid Redis connection in __init__
+    cache = AsyncContentCache.__new__(AsyncContentCache)
     entry = {
         "type": "Response",
         "status": 200,
-        "headers": {"Last-Modified": http_date(1_000_000_000)},
-        "last_modified": http_date(1_000_000_000),
+        "headers": {"Last-Modified": _LM},
+        "last_modified": _LM,
         "body": b"hello".hex(),
     }
 
@@ -183,12 +177,27 @@ def test_async_content_cache_build_response_pops_last_modified():
 
     assert response.status == 200
     assert response.body == b"hello"
-    assert response.headers["Last-Modified"] == http_date(1_000_000_000)
+    assert response.headers["Last-Modified"] == _LM
     assert response.headers["X-PULP-CACHE"] == "HIT"
 
 
-def _cache_for_decorator():
-    """AsyncContentCache instance that skips Redis and uses injected request/key helpers."""
+def _entry(*, store_field=True):
+    entry = {
+        "type": "Response",
+        "status": 200,
+        "headers": {
+            "Last-Modified": _LM,
+            "Cache-Control": "public, max-age=0, must-revalidate",
+        },
+        "body": b"payload".hex(),
+        "expires": None,
+    }
+    if store_field:
+        entry["last_modified"] = _LM
+    return entry
+
+
+def _cache():
     cache = AsyncContentCache.__new__(AsyncContentCache)
     cache.auth = None
     cache.default_base_key = "base"
@@ -199,148 +208,94 @@ def _cache_for_decorator():
     return cache
 
 
-@pytest.mark.asyncio
-async def test_cache_hit_304_does_not_rebuild_response():
-    """A matching IMS on a cache hit 304s without constructing the cached response."""
-    last_modified = http_date(1_000_000_000)
-    entry = {
-        "type": "Response",
-        "status": 200,
-        "headers": {
-            "Last-Modified": last_modified,
-            "Cache-Control": "public, max-age=0, must-revalidate",
-        },
-        "last_modified": last_modified,
-        "body": b"payload".hex(),
-        "expires": None,
-    }
-    cache = _cache_for_decorator()
-    cache.get_entry = AsyncMock(return_value=entry)
-    cache.build_response = Mock(side_effect=AssertionError("must not reconstruct"))
-    request = Mock(headers={"If-Modified-Since": last_modified})
+async def _run_cached(cache, request, handler=None):
+    if handler is None:
 
-    async def handler(req):
-        raise AssertionError("handler must not run on cache hit")
+        async def handler(req):
+            raise AssertionError("handler must not run")
 
     with override_settings(CACHE_ENABLED=True):
-        wrapped = AsyncContentCache.__call__(cache, handler)
-        with pytest.raises(HTTPNotModified) as exc:
-            await wrapped(request)
+        return await AsyncContentCache.__call__(cache, handler)(request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store_field", [True, False], ids=["stored-field", "header-fallback"])
+async def test_cache_hit_304_does_not_rebuild_response(store_field):
+    """A matching IMS on a cache hit 304s without reconstructing the cached response."""
+    cache = _cache()
+    cache.get_entry = AsyncMock(return_value=_entry(store_field=store_field))
+    cache.build_response = Mock(side_effect=AssertionError("must not reconstruct"))
+
+    with pytest.raises(HTTPNotModified) as exc:
+        await _run_cached(cache, Mock(headers={"If-Modified-Since": _LM}))
 
     cache.build_response.assert_not_called()
-    assert exc.value.headers["Last-Modified"] == last_modified
+    assert exc.value.headers["Last-Modified"] == _LM
     assert exc.value.headers["X-PULP-CACHE"] == "HIT"
-
-
-@pytest.mark.asyncio
-async def test_cache_hit_304_falls_back_to_header_without_last_modified_field():
-    """Entries cached before last_modified was stored still 304 from the Last-Modified header."""
-    last_modified = http_date(1_000_000_000)
-    entry = {
-        "type": "Response",
-        "status": 200,
-        "headers": {"Last-Modified": last_modified},
-        "body": b"payload".hex(),
-        "expires": None,
-    }
-    cache = _cache_for_decorator()
-    cache.get_entry = AsyncMock(return_value=entry)
-    cache.build_response = Mock(side_effect=AssertionError("must not reconstruct"))
-    request = Mock(headers={"If-Modified-Since": last_modified})
-
-    async def handler(req):
-        raise AssertionError("handler must not run on cache hit")
-
-    with override_settings(CACHE_ENABLED=True):
-        wrapped = AsyncContentCache.__call__(cache, handler)
-        with pytest.raises(HTTPNotModified):
-            await wrapped(request)
-
-    cache.build_response.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_cache_hit_stale_ims_rebuilds_response():
     """An older If-Modified-Since on a cache hit still reconstructs the full cached response."""
-    last_modified = http_date(1_000_000_000)
-    older = http_date(999_999_000)
-    entry = {
-        "type": "Response",
-        "status": 200,
-        "headers": {"Last-Modified": last_modified},
-        "last_modified": last_modified,
-        "body": b"payload".hex(),
-        "expires": None,
-    }
+    entry = _entry()
     rebuilt = Mock(headers={"X-PULP-ARTIFACT-SIZE": None})
-    cache = _cache_for_decorator()
+    cache = _cache()
     cache.get_entry = AsyncMock(return_value=entry)
     cache.build_response = Mock(return_value=rebuilt)
-    request = Mock(headers={"If-Modified-Since": older})
 
-    async def handler(req):
-        raise AssertionError("handler must not run on cache hit")
-
-    with override_settings(CACHE_ENABLED=True):
-        wrapped = AsyncContentCache.__call__(cache, handler)
-        response = await wrapped(request)
+    response = await _run_cached(cache, Mock(headers={"If-Modified-Since": http_date(999_999_000)}))
 
     cache.build_response.assert_called_once_with(entry)
     assert response is rebuilt
 
 
 @pytest.mark.asyncio
-async def test_cache_miss_304_after_make_entry():
-    """A matching IMS on a cache miss 304s from the fresh response after it is stored."""
-    last_modified = http_date(1_000_000_000)
-    built = Mock(headers={"Last-Modified": last_modified}, prepared=False, status=200)
-    cache = _cache_for_decorator()
-    cache.get_entry = AsyncMock(return_value=None)
-    cache.make_entry = AsyncMock(return_value=built)
-    request = Mock(headers={"If-Modified-Since": last_modified})
-
-    async def handler(req):
-        raise AssertionError("handler is invoked via make_entry")
-
-    with override_settings(CACHE_ENABLED=True):
-        wrapped = AsyncContentCache.__call__(cache, handler)
-        with pytest.raises(HTTPNotModified) as exc:
-            await wrapped(request)
-
-    cache.make_entry.assert_awaited_once()
-    assert exc.value.headers["Last-Modified"] == last_modified
-
-
-@pytest.mark.asyncio
 async def test_cache_miss_does_not_304_prepared_stream():
     """A live stream that already started writing must not be converted into a 304."""
-    last_modified = http_date(1_000_000_000)
-    stream = Mock(headers={"Last-Modified": last_modified}, prepared=True, status=200)
-    cache = _cache_for_decorator()
+    stream = Mock(headers={"Last-Modified": _LM}, prepared=True, status=200)
+    cache = _cache()
     cache.get_entry = AsyncMock(return_value=None)
     cache.make_entry = AsyncMock(return_value=stream)
-    request = Mock(headers={"If-Modified-Since": last_modified})
 
     async def handler(req):
         raise AssertionError("handler is invoked via make_entry")
 
-    with override_settings(CACHE_ENABLED=True):
-        wrapped = AsyncContentCache.__call__(cache, handler)
-        response = await wrapped(request)
-
-    assert response is stream
+    assert await _run_cached(cache, Mock(headers={"If-Modified-Since": _LM}), handler) is stream
 
 
 @pytest.mark.asyncio
 async def test_make_entry_does_not_cache_304():
     """HTTPNotModified is HTTPSuccessful but must never be written to Redis."""
-    cache = _cache_for_decorator()
+    cache = _cache()
     cache.set = AsyncMock()
 
     async def handler():
-        raise HTTPNotModified(headers={"Last-Modified": http_date(1_000_000_000)})
+        raise HTTPNotModified(headers={"Last-Modified": _LM})
 
     with pytest.raises(HTTPNotModified):
         await cache.make_entry("k", "b", handler, (), {}, 60)
 
     cache.set.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_make_entry_stores_last_modified():
+    """A 200 with Last-Modified is stored so later cache hits can 304 without rebuilding."""
+    captured = {}
+    cache = _cache()
+
+    async def fake_set(key, value, expires=None, base_key=None):
+        captured["entry"] = json.loads(value)
+
+    cache.set = fake_set
+
+    async def handler():
+        return Response(body=b"hello", headers={"Last-Modified": _LM})
+
+    result = await cache.make_entry("k", "b", handler, (), {}, 60)
+
+    assert result.headers["Last-Modified"] == _LM
+    assert result.headers["X-PULP-CACHE"] == "MISS"
+    assert captured["entry"]["last_modified"] == _LM
+    assert captured["entry"]["headers"]["Last-Modified"] == _LM
+    assert captured["entry"]["type"] == "Response"

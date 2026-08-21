@@ -315,6 +315,7 @@ def test_search_task_using_an_invalid_name(pulpcore_bindings):
 
 @pytest.mark.parallel
 def test_filter_tasks_using_pulp_created_filter(pulpcore_bindings, dispatch_task):
+
     task1_href = dispatch_task("pulpcore.app.tasks.test.sleep", args=(0,))
 
     time.sleep(2)
@@ -604,6 +605,7 @@ def test_failing_worker_task_error_handling(dispatch_task, monitor_task):
 
 @pytest.fixture
 def resource_blocker(pulpcore_bindings, dispatch_task):
+
     @contextmanager
     def _resource_blocker(exclusive_resources: list[str], duration=20):
         task_href = dispatch_task(

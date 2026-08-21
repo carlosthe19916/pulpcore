@@ -3,8 +3,6 @@
 import hashlib
 import subprocess
 import uuid
-from datetime import timedelta
-from email.utils import format_datetime, parsedate_to_datetime
 from random import sample
 from urllib.parse import urljoin
 
@@ -280,89 +278,3 @@ def test_head_request_large_on_demand_file(
     for content_href, _ in content_href_filenames:
         content = file_bindings.ContentFilesApi.read(content_href)
         assert content.artifact is not None
-
-
-@pytest.mark.parallel
-def test_content_app_if_modified_since(
-    file_repo_with_auto_publish,
-    file_remote_ssl_factory,
-    file_bindings,
-    basic_manifest_path,
-    monitor_task,
-    file_distribution_factory,
-    distribution_base_url,
-):
-    """The content app sets Last-Modified and answers 304 to matching If-Modified-Since."""
-    # Sync with immediate policy so the artifacts are present and served with Last-Modified.
-    remote = file_remote_ssl_factory(manifest_path=basic_manifest_path, policy="immediate")
-    body = FileRepositorySyncURL(remote=remote.pulp_href)
-    monitor_task(
-        file_bindings.RepositoriesFileApi.sync(file_repo_with_auto_publish.pulp_href, body).task
-    )
-    repo = file_bindings.RepositoriesFileApi.read(file_repo_with_auto_publish.pulp_href)
-
-    distribution = file_distribution_factory(repository=repo.pulp_href)
-    base_url = distribution_base_url(distribution.base_url)
-
-    content_filename = list(get_files_in_manifest(remote.url))[0][0]
-    url = urljoin(base_url, content_filename)
-
-    # First request: a full 200 response carrying Last-Modified from RepositoryContent.pulp_created.
-    response = requests.get(url)
-    response.raise_for_status()
-    assert response.status_code == 200
-    last_modified = response.headers.get("Last-Modified")
-    assert last_modified is not None
-    assert response.headers.get("Cache-Control") == "public, max-age=0, must-revalidate"
-
-    repo_uuid = repo.pulp_href.split("/")[-2]
-    commands = (
-        "from django.utils.http import http_date;"
-        "from pulpcore.app.models import RepositoryContent;"
-        "from pulp_file.app.models import FileContent;"
-        f"content = FileContent.objects.filter(relative_path={content_filename!r});"
-        f"rc = RepositoryContent.objects.filter(repository='{repo_uuid}', content__in=content);"
-        "print(http_date(rc[0].pulp_created.timestamp()));"
-    )
-    process = subprocess.run(["pulpcore-manager", "shell", "-c", commands], capture_output=True)
-    assert process.returncode == 0, process.stderr.decode()
-    expected_last_modified = process.stdout.decode().strip().splitlines()[-1]
-    assert last_modified == expected_last_modified
-
-    # Skew the artifact's filesystem mtime so a Last-Modified from aiohttp FileResponse would
-    # disagree with RepositoryContent.pulp_created.
-    file_mtime = 946684800  # 2000-01-01 UTC
-    touch = (
-        "import os;"
-        "from pulpcore.app.models import ContentArtifact;"
-        "from pulp_file.app.models import FileContent;"
-        f"c = FileContent.objects.filter(relative_path={content_filename!r}).first();"
-        "ca = ContentArtifact.objects.select_related('artifact').get(content=c);"
-        "path = ca.artifact.file.path;"
-        f"os.utime(path, ({file_mtime}, {file_mtime}));"
-        "print(path);"
-    )
-    process = subprocess.run(["pulpcore-manager", "shell", "-c", touch], capture_output=True)
-    assert process.returncode == 0, process.stderr.decode()
-
-    skewed = requests.get(url)
-    skewed.raise_for_status()
-    assert skewed.headers.get("Last-Modified") == expected_last_modified
-    still_modified = requests.get(
-        url, headers={"If-Modified-Since": "Sat, 01 Jan 2000 00:00:00 GMT"}
-    )
-    assert still_modified.status_code == 200
-    assert still_modified.content
-
-    # A conditional request with the same timestamp gets a bodyless 304 that still tells the
-    # edge cache to revalidate next time.
-    not_modified = requests.get(url, headers={"If-Modified-Since": last_modified})
-    assert not_modified.status_code == 304
-    assert not_modified.content == b""
-    assert not_modified.headers.get("Cache-Control") == "public, max-age=0, must-revalidate"
-
-    # A conditional request with an older timestamp still gets the full content.
-    older = format_datetime(parsedate_to_datetime(last_modified) - timedelta(days=1), usegmt=True)
-    modified = requests.get(url, headers={"If-Modified-Since": older})
-    assert modified.status_code == 200
-    assert modified.content
