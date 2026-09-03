@@ -693,6 +693,15 @@ def normalize_http_status(status):
         return ""
 
 
+def check_request_not_modified(request, last_modified):
+    """Check if the request is not modified."""
+    if not last_modified:
+        return False
+    if request.headers.get("If-Modified-Since") <= last_modified:
+        return True
+    return False
+
+
 class HashingFileWriter(RawIOBase):
     """
     A file-like object that handles writing data to disk with simultaneous
