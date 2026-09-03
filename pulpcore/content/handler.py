@@ -17,6 +17,7 @@ from aiohttp.web_exceptions import (
     HTTPFound,
     HTTPMovedPermanently,
     HTTPNotFound,
+    HTTPNotModified,
     HTTPRequestRangeNotSatisfiable,
 )
 from asgiref.sync import sync_to_async
@@ -56,6 +57,7 @@ from pulpcore.app.models import (  # noqa: E402
 )
 from pulpcore.app.util import (  # noqa: E402
     cache_key,
+    check_request_not_modified,
     get_domain,
 )
 from pulpcore.cache import AsyncContentCache  # noqa: E402
@@ -66,6 +68,8 @@ from pulpcore.exceptions import (  # noqa: E402
 from pulpcore.metrics import artifacts_size_counter  # noqa: E402
 
 log = logging.getLogger(__name__)
+
+EDGE_CACHE_CONTROL = "public, max-age=0, must-revalidate"
 
 
 class PathNotResolved(HTTPNotFound):
@@ -524,6 +528,8 @@ class Handler:
         if content_type:
             headers["Content-Type"] = content_type
 
+        headers["Cache-Control"] = EDGE_CACHE_CONTROL
+
         # Let plugin-Distribution set headers for this path if it wants.
         if distribution:
             headers.update(distribution.content_headers_for(path))
@@ -720,6 +726,9 @@ class Handler:
         content_handler_result = await sync_to_async(distro.content_handler)(original_rel_path)
         if content_handler_result is not None:
             if isinstance(content_handler_result, ContentArtifact):
+                await self._add_last_modified_header(
+                    headers, content_artifact=content_handler_result, distribution=distro
+                )
                 if content_handler_result.artifact:
                     return await self._serve_content_artifact(
                         content_handler_result, headers, request
@@ -755,6 +764,9 @@ class Handler:
                     raise HTTPMovedPermanently(f"{request.path}/")
                 original_rel_path = index_path
                 headers = self.response_headers(original_rel_path, distro)
+                await self._add_last_modified_header(
+                    headers, last_modified=publication.pulp_created
+                )
             except ObjectDoesNotExist:
                 dir_list, dates, sizes = await self.list_directory(None, publication, rel_path)
                 dir_list.update(
@@ -813,6 +825,11 @@ class Handler:
                 except ObjectDoesNotExist:
                     pass
                 else:
+                    await self._add_last_modified_header(
+                        headers,
+                        content_artifact=ca,
+                        repository_version=publication.repository_version,
+                    )
                     if ca.artifact:
                         return await self._serve_content_artifact(ca, headers, request)
                     else:
@@ -824,6 +841,10 @@ class Handler:
         if distro.SERVE_FROM_PUBLICATION:
             ca = await sync_to_async(distro.get_fallback_ca)(original_rel_path)
             if ca is not None:
+                # TODO update get_fallback_ca to return the publication used
+                await self._add_last_modified_header(
+                    headers, content_artifact=ca, repository_version=repo_version
+                )
                 if ca.artifact:
                     return await self._serve_content_artifact(ca, headers, request)
                 else:
@@ -871,6 +892,9 @@ class Handler:
             except ObjectDoesNotExist:
                 pass
             else:
+                await self._add_last_modified_header(
+                    headers, content_artifact=ca, repository_version=repo_version
+                )
                 if ca.artifact:
                     return await self._serve_content_artifact(ca, headers, request)
                 else:
@@ -934,6 +958,34 @@ class Handler:
         else:
             reason = None
         raise PathNotResolved(path, reason=reason)
+
+    async def _add_last_modified_header(
+        self,
+        headers,
+        last_modified=None,
+        content_artifact=None,
+        repository_version=None,
+        distribution=None,
+    ):
+        """
+        Add the last-modified header to the response headers if not already present.
+        """
+
+        def _find_repo_add_time():
+            if not repository_version:
+                _, rv, _ = distribution.get_repository_publication_and_version()
+            else:
+                rv = repository_version
+            cpk = content_artifact.content_id
+
+            rc = rv._content_relationships().filter(content_id=cpk).first()
+            headers["Last-Modified"] = rc.pulp_created if rc else rv.pulp_created
+
+        if "Last-Modified" not in headers:
+            if last_modified is not None:
+                headers["Last-Modified"] = last_modified
+            elif content_artifact and (repository_version or distribution):
+                await sync_to_async(_find_repo_add_time)()
 
     async def _stream_content_artifact(self, request, response, content_artifact):
         """
@@ -1174,9 +1226,16 @@ class Handler:
             size = artifact_file.size or "*"
             raise HTTPRequestRangeNotSatisfiable(headers={"Content-Range": f"bytes */{size}"})
 
+        response = self._build_response_from_content_artifact(content_artifact, headers, request)
+
+        if check_request_not_modified(request, headers.get("Last-Modified")):
+            nmod_response = HTTPNotModified(headers={"Cache-Control": EDGE_CACHE_CONTROL})
+            if settings.CACHE_ENABLED:
+                nmod_response.future_response = response
+            raise nmod_response
+
         artifacts_size_counter.add(content_length)
 
-        response = self._build_response_from_content_artifact(content_artifact, headers, request)
         if isinstance(response, HTTPFound):
             raise response
         else:
