@@ -22,6 +22,7 @@ from aiohttp.web_exceptions import (
 )
 from asgiref.sync import sync_to_async
 from django.utils import timezone
+from django.utils.http import http_date
 from multidict import CIMultiDict
 from yarl import URL
 
@@ -57,7 +58,7 @@ from pulpcore.app.models import (  # noqa: E402
 )
 from pulpcore.app.util import (  # noqa: E402
     cache_key,
-    check_request_not_modified,
+    check_request_was_modified,
     get_domain,
 )
 from pulpcore.cache import AsyncContentCache  # noqa: E402
@@ -765,7 +766,7 @@ class Handler:
                 original_rel_path = index_path
                 headers = self.response_headers(original_rel_path, distro)
                 await self._add_last_modified_header(
-                    headers, last_modified=publication.pulp_created
+                    headers, suggested_last_modified=publication.pulp_created
                 )
             except ObjectDoesNotExist:
                 dir_list, dates, sizes = await self.list_directory(None, publication, rel_path)
@@ -962,7 +963,7 @@ class Handler:
     async def _add_last_modified_header(
         self,
         headers,
-        last_modified=None,
+        suggested_last_modified: datetime | None = None,
         content_artifact=None,
         repository_version=None,
         distribution=None,
@@ -979,13 +980,17 @@ class Handler:
             cpk = content_artifact.content_id
 
             rc = rv._content_relationships().filter(content_id=cpk).first()
-            headers["Last-Modified"] = rc.pulp_created if rc else rv.pulp_created
+            return rc.pulp_created if rc else rv.pulp_created
 
         if "Last-Modified" not in headers:
-            if last_modified is not None:
-                headers["Last-Modified"] = last_modified
+            last_modified = None
+            if suggested_last_modified is not None:
+                last_modified = suggested_last_modified
             elif content_artifact and (repository_version or distribution):
-                await sync_to_async(_find_repo_add_time)()
+                last_modified = await sync_to_async(_find_repo_add_time)()
+
+            if last_modified is not None:
+                headers["Last-Modified"] = http_date(last_modified.timestamp())
 
     async def _stream_content_artifact(self, request, response, content_artifact):
         """
@@ -1228,7 +1233,7 @@ class Handler:
 
         response = self._build_response_from_content_artifact(content_artifact, headers, request)
 
-        if check_request_not_modified(request, headers.get("Last-Modified")):
+        if not check_request_was_modified(request, last_modified=headers.get("Last-Modified")):
             nmod_response = HTTPNotModified(headers={"Cache-Control": EDGE_CACHE_CONTROL})
             if settings.CACHE_ENABLED:
                 nmod_response.future_response = response

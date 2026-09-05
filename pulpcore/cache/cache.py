@@ -17,7 +17,7 @@ from pulpcore.app.redis_connection import (
     get_async_redis_connection,
     get_redis_connection,
 )
-from pulpcore.app.util import check_request_not_modified
+from pulpcore.app.util import check_request_was_modified
 from pulpcore.metrics import artifacts_size_counter
 from pulpcore.responses import ArtifactResponse
 
@@ -395,7 +395,9 @@ class AsyncContentCache(AsyncCache):
             return None
 
         headers = entry.get("headers", {})
-        if request and check_request_not_modified(request, headers.get("Last-Modified")):
+        if request and not check_request_was_modified(
+            request, last_modified=headers.get("Last-Modified")
+        ):
             response = HTTPNotModified(headers={"Cache-Control": headers.get("Cache-Control")})
         else:
             response = self.RESPONSE_TYPES[response_type](**entry)
