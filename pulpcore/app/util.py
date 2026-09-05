@@ -17,6 +17,7 @@ from django.apps import apps
 from django.conf import settings
 from django.db import connection
 from django.db.models import Model, UUIDField
+from django.utils.http import parse_http_date
 from rest_framework.reverse import reverse as drf_reverse
 from rest_framework.serializers import ValidationError
 
@@ -693,13 +694,20 @@ def normalize_http_status(status):
         return ""
 
 
-def check_request_not_modified(request, last_modified):
-    """Check if the request is not modified."""
+def check_request_was_modified(request, last_modified):
     if not last_modified:
-        return False
-    if request.headers.get("If-Modified-Since") <= last_modified:
         return True
-    return False
+
+    if_modified_since = request.headers.get("If-Modified-Since")
+    if not if_modified_since:
+        return True
+
+    try:
+        last_modified_ts = parse_http_date(last_modified)
+        if_modified_ts = parse_http_date(if_modified_since)
+        return last_modified_ts > if_modified_ts
+    except (TypeError, ValueError):
+        return True
 
 
 class HashingFileWriter(RawIOBase):
