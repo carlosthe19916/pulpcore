@@ -842,7 +842,6 @@ class Handler:
         if distro.SERVE_FROM_PUBLICATION:
             ca = await sync_to_async(distro.get_fallback_ca)(original_rel_path)
             if ca is not None:
-                # TODO update get_fallback_ca to return the publication used
                 await self._add_last_modified_header(
                     headers, content_artifact=ca, repository_version=repo_version
                 )

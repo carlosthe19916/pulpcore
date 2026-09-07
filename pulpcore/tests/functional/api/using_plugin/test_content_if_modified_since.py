@@ -39,16 +39,28 @@ def assert_not_modified(response):
     assert response.headers.get("Cache-Control") == EDGE_CACHE_CONTROL
 
 
+def assert_object_storage_redirect(response):
+    """On Azure/S3, pulpcore answers with a 302 to the object store, carrying the revalidation
+    headers - it does not stream the bytes itself."""
+    assert response.status_code == 302
+    assert response.headers.get("Location")
+    assert response.headers.get("Cache-Control") == EDGE_CACHE_CONTROL
+    # Last-Modified must be a real date in the past - never missing, epoch, or in the future.
+    last_modified = response.headers.get("Last-Modified")
+    assert last_modified
+    assert 0 < parse_http_date(last_modified) <= time.time()
+
+
 @pytest.fixture
-def inline_storage(pulp_settings):
-    """Skip when the instance redirects to object storage instead of serving bytes inline."""
+def assert_full_response(pulp_settings):
+    """Return the right assertion for a served (non-304) response on this backend: full bytes on
+    the filesystem, or a redirect to the object store on Azure/S3."""
     backend = pulp_settings.STORAGES["default"]["BACKEND"]
     redirects = (
         backend != "pulpcore.app.models.storage.FileSystem"
         and pulp_settings.REDIRECT_TO_OBJECT_STORAGE
     )
-    if redirects:
-        pytest.skip("object-storage redirects do not serve bytes inline")
+    return assert_object_storage_redirect if redirects else assert_full_download
 
 
 @pytest.fixture
@@ -77,13 +89,13 @@ def distribution_url(distribution, distribution_base_url):
 
 
 @pytest.mark.parallel
-def test_a_current_copy_is_not_redownloaded(distribution_url, inline_storage):
+def test_a_current_copy_is_not_redownloaded(distribution_url, assert_full_response):
     """A client whose copy is already up to date gets a 304 instead of the file."""
     url = urljoin(distribution_url, "1.iso")
 
     # Download once and remember the date the server reported.
     first = requests.get(url, allow_redirects=False)
-    assert_full_download(first)
+    assert_full_response(first)
     served_date = first.headers["Last-Modified"]
 
     # Asking again with that exact date -> nothing changed -> 304.
@@ -97,21 +109,21 @@ def test_a_current_copy_is_not_redownloaded(distribution_url, inline_storage):
 
 
 @pytest.mark.parallel
-def test_a_stale_copy_gets_the_full_file(distribution_url, inline_storage):
+def test_a_stale_copy_gets_the_full_file(distribution_url, assert_full_response):
     """A client whose copy predates the file downloads the whole thing again."""
     url = urljoin(distribution_url, "1.iso")
 
     # "I last saw this at the dawn of time" -> the file is newer -> send it all.
     long_ago = http_date(0)
     response = requests.get(url, headers={"If-Modified-Since": long_ago}, allow_redirects=False)
-    assert_full_download(response)
+    assert_full_response(response)
 
 
 @pytest.mark.parallel
 def test_authorization_runs_before_revalidation(
     distribution,
     distribution_url,
-    inline_storage,
+    assert_full_response,
     pulpcore_bindings,
     file_bindings,
     gen_object_with_cleanup,
@@ -139,7 +151,7 @@ def test_authorization_runs_before_revalidation(
 
     # With credentials the normal conversation works: full download, then 304.
     authorized = requests.get(url, headers=credentials, allow_redirects=False)
-    assert_full_download(authorized)
+    assert_full_response(authorized)
 
     revalidated = requests.get(
         url,
@@ -150,7 +162,9 @@ def test_authorization_runs_before_revalidation(
 
 
 @pytest.mark.parallel
-def test_cache_still_honors_conditional_requests(distribution_url, inline_storage, redis_status):
+def test_cache_still_honors_conditional_requests(
+    distribution_url, assert_full_response, redis_status
+):
     """A cached response revalidates to 304 but still serves the file to a client without a copy."""
     if not redis_status:
         pytest.skip("Could not connect to the Redis server")
@@ -158,7 +172,7 @@ def test_cache_still_honors_conditional_requests(distribution_url, inline_storag
     url = urljoin(distribution_url, "1.iso")
 
     # Warm the cache with a normal download.
-    assert_full_download(requests.get(url, allow_redirects=False))
+    assert_full_response(requests.get(url, allow_redirects=False))
 
     # A cached response can still answer a conditional request with a 304.
     tomorrow = http_date(time.time() + 3600)
@@ -168,5 +182,5 @@ def test_cache_still_honors_conditional_requests(distribution_url, inline_storag
 
     # A client without a copy still gets the full file from that same cache entry.
     fresh = requests.get(url, allow_redirects=False)
-    assert_full_download(fresh)
+    assert_full_response(fresh)
     assert fresh.headers.get("X-PULP-CACHE") == "HIT"
